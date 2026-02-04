@@ -10,10 +10,10 @@ try:
     from config import API_ID, API_HASH, BOT_TOKEN, SESSION_STRING, OWNER_ID
 except ImportError:
     # Fill these if you don't have a config.py
-    API_ID = 123456  
-    API_HASH = "your_api_hash"
-    BOT_TOKEN = "your_bot_token"
-    SESSION_STRING = "your_pyrogram_string_session" # Userbot session is MUST for private channels
+    API_ID = 21705136
+    API_HASH = "78730e89d196e160b0f1992018c6cb19"
+    BOT_TOKEN = "8573758498:AAEplnYzHwUmjYRFiRSdCAFwyPfYIjk7RIk"
+    SESSION_STRING = "" # Userbot session is MUST for private channels
     OWNER_ID = [123456789] 
 
 # Logging Setup
