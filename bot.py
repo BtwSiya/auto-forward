@@ -3,7 +3,7 @@ import logging
 import random
 import re
 from pyrogram import Client, filters, idle
-from pyrogram.errors import FloodWait, RPCError, UserAlreadyParticipant
+from pyrogram.errors import FloodWait, RPCError, UserAlreadyParticipant, MessageNotModified
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # ================= CONFIGURATION =================
@@ -17,14 +17,14 @@ logging.basicConfig(level=logging.ERROR)
 app = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 userbot = Client("userbot_session", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
-# Storage
-BATCH_TASKS = {}
-USER_STATE = {} # Format: {user_id: {"step": "SOURCE/DEST", "data": {}}}
+# Global Storage
+BATCH_TASKS = {} # {task_id: {data}}
+USER_STATE = {}
 
 # ================= UTILS =================
 
 async def resolve_chat(link_or_id: str):
-    link_or_id = link_or_id.strip()
+    link_or_id = str(link_or_id).strip()
     if re.match(r"^-?\d+$", link_or_id):
         return int(link_or_id)
     if "t.me/c/" in link_or_id:
@@ -52,133 +52,152 @@ def extract_msg_id(link: str):
     try: return int(link.split("/")[-1])
     except: return 1
 
-# ================= THE CORE WORKER =================
+# ================= LIVE MONITOR ENGINE =================
+
+async def update_log(task_id):
+    """Updates the progress message in DM every few seconds."""
+    task = BATCH_TASKS.get(task_id)
+    if not task: return
+    
+    try:
+        log_text = (
+            f"📊 **Live Task Report: {task_id}**\n\n"
+            f"📤 **Source:** `{task['source']}`\n"
+            f"📥 **Destination:** `{task['dest']}`\n"
+            f"🔄 **Current Msg ID:** `{task['current']}`\n"
+            f"✅ **Total Forwarded:** `{task['total']}`\n\n"
+            f"⏳ *Status: Running...*"
+        )
+        await app.edit_message_text(
+            task['user_id'], 
+            task['log_msg_id'], 
+            log_text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🛑 Stop Task {task_id}", callback_data=f"kill_{task_id}")]])
+        )
+    except MessageNotModified: pass
+    except Exception: pass
 
 async def run_batch_worker(task_id):
-    """
-    Handles everything. No separate listener needed.
-    This prevents double forwarding.
-    """
-    task = BATCH_TASKS[task_id]
-    while BATCH_TASKS.get(task_id) and BATCH_TASKS[task_id]['running']:
+    """The Engine: Handles backlog and real-time syncing."""
+    while task_id in BATCH_TASKS and BATCH_TASKS[task_id]['running']:
+        task = BATCH_TASKS[task_id]
         try:
             msg = await userbot.get_messages(task['source'], task['current'])
             
             if not msg or msg.empty:
-                await asyncio.sleep(3) # Wait for new posts naturally
+                await asyncio.sleep(5) # Auto-check interval
                 continue
 
             if not msg.service:
                 try:
-                    # Cloning Restricted Content
                     await userbot.copy_message(task['dest'], task['source'], msg.id)
-                    await asyncio.sleep(3) # Fixed 3s Delay
+                    task['total'] += 1
+                    # Update Log Message in DM
+                    if task['total'] % 2 == 0: # Update every 2 messages to save API hits
+                        await update_log(task_id)
+                    await asyncio.sleep(3) # 3s delay as requested
                 except FloodWait as e:
                     await asyncio.sleep(e.value + 2)
-                except Exception:
-                    pass 
+                except Exception: pass
 
             task['current'] += 1
+            
         except Exception:
             await asyncio.sleep(5)
 
-# ================= BOT HANDLERS =================
+# ================= HANDLERS =================
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, message):
-    USER_STATE[message.from_user.id] = None # Reset state
+    USER_STATE[message.from_user.id] = None
     text = (
-        "🚀 **Advanced Enterprise Forwarder**\n\n"
-        "**Status:** `System Operational ✅`\n"
-        "**Delay:** `3.0 Seconds (Anti-Flood)`\n"
-        "**Logic:** `No-Double Forwarding Engine`"
+        "🚀 **Advanced Media Forwarder v3**\n\n"
+        "**System:** `Stable & Monitoring ✅`\n"
+        "**Features:** `Live Logs`, `3s Delay`, `Auto-Sync`"
     )
     btns = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚡ Create New Task", callback_data="new_batch")],
-        [InlineKeyboardButton("📊 System Monitor", callback_data="view_status")]
+        [InlineKeyboardButton("➕ Start Forwarding", callback_data="new_batch")],
+        [InlineKeyboardButton("📊 Active Tasks", callback_data="view_status")]
     ])
     await message.reply_text(text, reply_markup=btns)
 
 @app.on_callback_query()
-async def query_processor(client, query: CallbackQuery):
+async def cb_handler(client, query: CallbackQuery):
     uid = query.from_user.id
+    data = query.data
 
-    if query.data == "new_batch":
-        USER_STATE[uid] = {"step": "AWAIT_SOURCE", "data": {}}
-        await query.message.edit_text(
-            "📤 **Step 1:**\nPlease send the **Source Link or ID**.\n\n"
-            "Example: `https://t.me/c/12345/10`",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="back_home")]])
-        )
+    if data == "new_batch":
+        USER_STATE[uid] = {"step": "SOURCE"}
+        await query.message.edit_text("🔗 **Step 1:**\nSend the **Source Channel Link/ID**.")
 
-    elif query.data == "view_status":
-        active = [f"🔹 `Task {tid}` | Next ID: `{data['current']}`" for tid, data in BATCH_TASKS.items() if data['running'] and data['user_id'] == uid]
-        if not active:
+    elif data == "view_status":
+        active_btns = []
+        for tid, t_info in BATCH_TASKS.items():
+            if t_info['running'] and t_info['user_id'] == uid:
+                active_btns.append([InlineKeyboardButton(f"🛑 Kill Task {tid} (Msg: {t_info['current']})", callback_data=f"kill_{tid}")])
+        
+        if not active_btns:
             return await query.answer("No active tasks found!", show_alert=True)
         
-        txt = "📊 **Live Task Monitor:**\n\n" + "\n".join(active)
-        btns = [[InlineKeyboardButton(f"🛑 Kill Task {t.split(' ')[1]}", callback_data=f"stop_{t.split(' ')[1]}")] for t in active]
-        btns.append([InlineKeyboardButton("🔙 Menu", callback_data="back_home")])
-        await query.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(btns))
+        active_btns.append([InlineKeyboardButton("🔙 Back", callback_data="back_home")])
+        await query.message.edit_text("📋 **System Monitor:**\nSelect a task to terminate it.", reply_markup=InlineKeyboardMarkup(active_btns))
 
-    elif query.data.startswith("stop_"):
-        tid = int(query.data.split("_")[1])
+    elif data.startswith("kill_"):
+        tid = int(data.split("_")[1])
         if tid in BATCH_TASKS:
             BATCH_TASKS[tid]['running'] = False
-            await query.answer(f"Task {tid} terminated.", show_alert=True)
-            await query.message.delete()
+            await query.answer(f"Task {tid} Stopped!", show_alert=True)
+            await query.message.edit_text(f"✅ **Task {tid} has been terminated.**")
+            del BATCH_TASKS[tid]
 
-    elif query.data == "back_home":
+    elif data == "back_home":
         await start_handler(client, query.message)
 
 @app.on_message(filters.private & ~filters.command("start"))
-async def conversation_handler(client, message):
+async def state_manager(client, message):
     uid = message.from_user.id
-    if uid not in USER_STATE or not USER_STATE[uid]:
-        return
+    if uid not in USER_STATE or not USER_STATE[uid]: return
 
-    state = USER_STATE[uid]["step"]
-
-    if state == "AWAIT_SOURCE":
+    step = USER_STATE[uid]["step"]
+    if step == "SOURCE":
         source = await resolve_chat(message.text)
         start_id = extract_msg_id(message.text)
-        if not source:
-            return await message.reply("❌ **Invalid Source!** Try again.")
-        
-        USER_STATE[uid]["data"]["source"] = source
-        USER_STATE[uid]["data"]["current"] = start_id
-        USER_STATE[uid]["step"] = "AWAIT_DEST"
-        await message.reply("📥 **Step 2:**\nNow send the **Destination Link or ID**.")
+        if not source: return await message.reply("❌ **Invalid Source!** Check Userbot.")
+        USER_STATE[uid] = {"step": "DEST", "source": source, "current": start_id}
+        await message.reply("📥 **Step 2:**\nSend the **Destination Channel ID or Link**.")
 
-    elif state == "AWAIT_DEST":
+    elif step == "DEST":
         dest = await resolve_chat(message.text)
-        if not dest:
-            return await message.reply("❌ **Invalid Destination!** Try again.")
-
-        data = USER_STATE[uid]["data"]
-        tid = random.randint(100, 999)
+        if not dest: return await message.reply("❌ **Invalid Destination!** Check Bot Permissions.")
         
-        BATCH_TASKS[tid] = {
-            "source": data["source"],
+        task_data = USER_STATE[uid]
+        task_id = random.randint(100, 999)
+        
+        # Create a Log Message that will be edited later
+        log_msg = await message.reply(f"⏳ **Initializing Task {task_id}...**")
+        
+        BATCH_TASKS[task_id] = {
+            "source": task_data['source'],
             "dest": dest,
-            "current": data["current"],
+            "current": task_data['current'],
+            "total": 0,
             "running": True,
-            "user_id": uid
+            "user_id": uid,
+            "log_msg_id": log_msg.id
         }
         
-        USER_STATE[uid] = None # Reset state
-        asyncio.create_task(run_batch_worker(tid))
-        await message.reply(f"✅ **Task {tid} Started!**\nCloning restricted content with 3s delay.")
+        USER_STATE[uid] = None
+        asyncio.create_task(run_batch_worker(task_id))
 
-# ================= SYSTEM BOOT =================
+# ================= BOOT =================
 
 async def main():
     await app.start()
     await userbot.start()
-    print("--- Enterprise Forwarder is LIVE (No-Pyromod) ---")
+    print("--- Pro Forwarder Ready ---")
     await idle()
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
-        
+    
