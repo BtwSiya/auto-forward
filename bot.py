@@ -25,6 +25,7 @@ userbot = Client("userbot_session", api_id=API_ID, api_hash=API_HASH, session_st
 
 BATCH_TASKS = {}
 USER_STATE = {}
+PROCESSED_GROUPS = {} # To fix 3-4 times repeat issue
 
 # ================= SMART UTILS =================
 
@@ -90,37 +91,40 @@ async def run_batch_worker(task_id):
 
             if not msg.service:
                 try:
-                    # ALBUM HANDLING (Fixing the 'str' error)
+                    # ALBUM HANDLING (Fixing Duplicate Sending)
                     if msg.media_group_id:
-                        await update_live_report(task_id, "Detected Album (Grouping)...")
+                        if msg.media_group_id in PROCESSED_GROUPS:
+                            t['current'] += 1
+                            continue # Skip already processed album part
+                        
+                        await update_live_report(task_id, "Processing Album (Grouping)...")
                         try:
+                            # Try copy first
                             await userbot.copy_media_group(t['dest'], t['source'], msg.id)
                             t['total'] += 1
+                            PROCESSED_GROUPS[msg.media_group_id] = True
                         except ChatForwardsRestricted:
+                            # Download & Upload bypass for Albums (Fix Black Screen)
                             await update_live_report(task_id, "Downloading Restricted Album...")
                             album = await userbot.get_media_group(t['source'], msg.id)
                             media_group = []
-                            files_to_delete = []
-                            
+                            paths = []
                             for m in album:
-                                file_path = await userbot.download_media(m)
-                                files_to_delete.append(file_path)
-                                
-                                if m.photo:
-                                    media_group.append(InputMediaPhoto(file_path, caption=m.caption))
-                                elif m.video:
-                                    media_group.append(InputMediaVideo(file_path, caption=m.caption))
-                                else:
-                                    media_group.append(InputMediaDocument(file_path, caption=m.caption))
+                                path = await userbot.download_media(m)
+                                if path:
+                                    paths.append(path)
+                                    if m.photo: media_group.append(InputMediaPhoto(path, caption=m.caption))
+                                    elif m.video: media_group.append(InputMediaVideo(path, caption=m.caption))
+                                    else: media_group.append(InputMediaDocument(path, caption=m.caption))
                             
-                            await update_live_report(task_id, "Uploading Grouped Media...")
-                            await userbot.send_media_group(t['dest'], media=media_group)
-                            
-                            for path in files_to_delete: 
-                                if os.path.exists(path): os.remove(path)
-                            t['total'] += 1
+                            if media_group:
+                                await userbot.send_media_group(t['dest'], media=media_group)
+                                t['total'] += 1
+                                PROCESSED_GROUPS[msg.media_group_id] = True
+                            for p in paths:
+                                if os.path.exists(p): os.remove(p)
                     
-                    # SINGLE MESSAGE HANDLING
+                    # SINGLE MESSAGE HANDLING (Fixing Black Screen)
                     else:
                         try:
                             await userbot.copy_message(t['dest'], t['source'], msg.id)
@@ -131,7 +135,7 @@ async def run_batch_worker(task_id):
                             if path:
                                 await update_live_report(task_id, "Uploading to Destination...")
                                 if msg.photo: await userbot.send_photo(t['dest'], path, caption=msg.caption)
-                                elif msg.video: await userbot.send_video(t['dest'], path, caption=msg.caption)
+                                elif msg.video: await userbot.send_video(t['dest'], path, caption=msg.caption, supports_streaming=True)
                                 else: await userbot.send_document(t['dest'], path, caption=msg.caption)
                                 if os.path.exists(path): os.remove(path)
                                 t['total'] += 1
@@ -139,28 +143,27 @@ async def run_batch_worker(task_id):
                             
                 except Exception as e:
                     t['failed'] += 1
-                    t['last_error'] = str(e)
+                    t['last_error'] = str(e)[:100]
 
             t['current'] += 1
             await update_live_report(task_id, "Waiting...")
-            await asyncio.sleep(3)
+            await asyncio.sleep(3.5) # Anti-flood delay
 
         except FloodWait as e:
             await asyncio.sleep(e.value + 5)
         except Exception as e:
-            t['last_error'] = f"Loop Error: {str(e)}"
+            t['last_error'] = f"Loop: {str(e)[:50]}"
             await asyncio.sleep(5)
 
-# ================= UI HANDLERS (No Changes) =================
+# ================= UI HANDLERS =================
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, message):
     text = (
-        "🚀 **Advanced Media Forwarder v5**\n\n"
-        "**Features:**\n"
-        "✅ Bypass Protected Content (No Black Screen)\n"
-        "✅ Album/Group Support (Fixed Error)\n"
-        "✅ Live Progress & Activity Tracking\n"
+        "🚀 **Advanced Media Forwarder v5 (Final Fix)**\n\n"
+        "✅ No Duplicates (Album Fix)\n"
+        "✅ No Black Screen (Bypass Fix)\n"
+        "✅ Live Activity Report\n"
         "✅ Unlimited File Size Support"
     )
     btns = InlineKeyboardMarkup([
@@ -174,7 +177,7 @@ async def cb_handler(client, query: CallbackQuery):
     uid, data = query.from_user.id, query.data
     if data == "new_batch":
         USER_STATE[uid] = {"step": "SOURCE"}
-        await query.message.edit_text("🔗 **Step 1:**\nSend the **Source Channel Link**.")
+        await query.message.edit_text("🔗 **Step 1:**\nSend Source Channel Link.")
     elif data == "view_status":
         active_btns = [[InlineKeyboardButton(f"🛑 Stop Task {tid}", callback_data=f"kill_{tid}")] 
                        for tid, t in BATCH_TASKS.items() if t['running'] and t['user_id'] == uid]
@@ -198,7 +201,7 @@ async def state_manager(client, message):
         if not source: return await msg.edit("❌ **Invalid Source!**")
         start_id = int(message.text.split("/")[-1]) if "/" in message.text and message.text.split("/")[-1].isdigit() else 1
         USER_STATE[uid] = {"step": "DEST", "source": source, "start": start_id}
-        await msg.edit(f"✅ **Source Found!**\n\n📥 **Step 2:**\nSend **Destination Channel Link**.")
+        await msg.edit(f"✅ **Source Found!**\n\n📥 **Step 2:**\nSend Destination Channel Link.")
     elif step == "DEST":
         msg = await message.reply("🔍 Checking Destination...")
         dest = await resolve_chat(message.text)
@@ -216,9 +219,8 @@ async def state_manager(client, message):
 async def main():
     await app.start()
     await userbot.start()
-    print("--- Pro Forwarder V5 Ready ---")
+    print("--- Pro Forwarder V5 Ready (Optimized) ---")
     await idle()
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
-                                                                  
