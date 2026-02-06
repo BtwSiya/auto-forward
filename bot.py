@@ -2,10 +2,12 @@ import asyncio
 import logging
 import re
 import random
+import os
 from pyrogram import Client, filters, idle
 from pyrogram.errors import (
     FloodWait, RPCError, UserAlreadyParticipant, 
-    MessageNotModified, ChatWriteForbidden, PeerIdInvalid
+    MessageNotModified, ChatWriteForbidden, ChatAdminRequired,
+    ChatForwardsRestricted
 )
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
@@ -15,268 +17,190 @@ API_HASH = "78730e89d196e160b0f1992018c6cb19"
 BOT_TOKEN = "8572528424:AAErREWZ0rxRYnzyJw06dRgOsrwQRcEhlkc"
 SESSION_STRING = "BQFGCokAgeUYbfqZyyM_tUlZOL9e4XM-eNqZX7_433fLwjvGB4SKL2YC6GBy-7S8ySKF4mwvaFE3FoUPQBrptI68vigVx7RBBwcUlV8LjHDK7CDuyin3nF8vIusS6g3ujLgQBBKajb7IhGPQVOMm-9q2kdROazENzXx-BHPVr3XaSeLM3gtPnY1T_y_RukGosNOfHTfwMkD0oS7fj0zl6KNwO4OgQEAFzTXmfpw9cAW9hCItiT16Q9UE9E75IhekfoPxCSVgwYt35fN7FCPzz8hQNIQwSLikifoeb5XAYSBGHwOnwIdiiovPwLZ9cB9tbEE4utODrHCqZLgVNhcTcjRcVod2MwAAAAF5efmpAA"
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
-# Bot Client
 app = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+userbot = Client("userbot_session", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, in_memory=True)
 
-# Userbot Client (In Memory to prevent database locks)
-userbot = Client(
-    "userbot_session", 
-    api_id=API_ID, 
-    api_hash=API_HASH, 
-    session_string=SESSION_STRING,
-    in_memory=True
-)
-
-# Global Storage
 BATCH_TASKS = {}
 USER_STATE = {}
 
 # ================= UTILS =================
 
-async def force_join(link_or_username):
-    """Tries to join the chat automatically."""
-    try:
-        if "t.me/+" in link_or_username or "joinchat" in link_or_username:
-            await userbot.join_chat(link_or_username)
-            return True
-        elif "t.me/" in link_or_username and "t.me/c/" not in link_or_username:
-            # Public username join
-            username = link_or_username.split("t.me/")[-1].split("/")[0]
-            await userbot.join_chat(username)
-            return True
-    except UserAlreadyParticipant:
-        return True
-    except Exception as e:
-        logger.warning(f"Auto-Join Failed for {link_or_username}: {e}")
-        return False
-
 async def resolve_chat(link_or_id: str):
-    """Resolves chat ID and Auto-Joins if necessary."""
     link_or_id = str(link_or_id).strip()
-    
-    # Clean ID from link if present (e.g., t.me/c/1234/55 -> t.me/c/1234)
-    if "/" in link_or_id and link_or_id.split("/")[-1].isdigit():
-        parts = link_or_id.split("/")
-        # Keep base link for joining logic, but we need ID for pyrogram
-        # We will re-process this later
-        pass
-
     try:
-        # CASE 1: Numeric ID
-        if re.match(r"^-?\d+$", link_or_id):
-            return int(link_or_id)
-        
-        # CASE 2: Private Channel Link (t.me/c/...)
+        if re.match(r"^-?\d+$", link_or_id): return int(link_or_id)
         if "t.me/c/" in link_or_id:
-            # Must be joined already or it will fail, private links act as IDs
-            chat_id = int("-100" + link_or_id.split("t.me/c/")[1].split("/")[0])
-            return chat_id
-
-        # CASE 3: Join Links / Public Usernames -> AUTO JOIN HERE
-        await force_join(link_or_id)
+            return int("-100" + link_or_id.split("t.me/c/")[1].split("/")[0])
         
-        # Get Chat Object
-        if "t.me/" in link_or_id:
-            # Extract username or join link processing
-            if "joinchat" in link_or_id or "+" in link_or_id:
-                 # If we joined successfully above, get_chat works with invite link sometimes
-                 # or we need to find the chat in dialogs (complex). 
-                 # Simplest: Userbot joins, then we rely on cached peer.
-                 chat = await userbot.get_chat(link_or_id)
-                 return chat.id
-            else:
-                username = link_or_id.split("t.me/")[-1].split("/")[0]
-                chat = await userbot.get_chat(username)
-                return chat.id
-                
-    except Exception as e:
-        logger.error(f"Resolve Error: {e}")
-        return None
-    return None
+        # Auto Join logic
+        try:
+            chat = await userbot.join_chat(link_or_id)
+            return chat.id
+        except UserAlreadyParticipant:
+            chat = await userbot.get_chat(link_or_id)
+            return chat.id
+        except Exception:
+            chat = await userbot.get_chat(link_or_id)
+            return chat.id
+    except Exception: return None
 
-def get_link_msg_id(link: str):
-    """Extracts Message ID from link."""
-    if "/" in link and link.split("/")[-1].isdigit():
-        return int(link.split("/")[-1])
-    return None
+# ================= CORE ENGINE =================
 
-# ================= ENGINE =================
-
-async def update_log(task_id):
-    task = BATCH_TASKS.get(task_id)
-    if not task: return
+async def update_live_report(task_id):
+    t = BATCH_TASKS.get(task_id)
+    if not t: return
+    
+    status = "⚙️ Processing" if t['running'] else "🛑 Stopped"
+    text = (
+        f"📊 **Task ID:** `{task_id}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ **Success:** `{t['total']}`\n"
+        f"❌ **Failed:** `{t['failed']}`\n"
+        f"⏭️ **Skipped:** `{t['skipped']}`\n"
+        f"📍 **Current ID:** `{t['current']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📢 **Status:** {status}\n"
+        f"⚠️ **Last Error:** `{t['last_error']}`"
+    )
+    
     try:
-        status_text = "🟢 **Running**" if task['running'] else "🔴 **Stopped**"
-        log_text = (
-            f"📊 **Live Task Report: {task_id}**\n\n"
-            f"🆔 **Source:** `{task['source']}`\n"
-            f"🎯 **Dest:** `{task['dest']}`\n"
-            f"🔢 **Processing Msg:** `{task['current']}`\n"
-            f"✅ **Copied:** `{task['total']}`\n"
-            f"⏭️ **Skipped:** `{task['skipped']}`\n\n"
-            f"⏳ *Status: {status_text}*"
-        )
         await app.edit_message_text(
-            task['user_id'], task['log_msg_id'], log_text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🛑 Stop {task_id}", callback_data=f"kill_{task_id}")]])
+            t['user_id'], t['log_msg_id'], text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Terminate Task", callback_data=f"kill_{task_id}")]])
         )
-    except: pass
+    except Exception: pass
 
 async def run_batch_worker(task_id):
-    consecutive_errors = 0
-    
     while task_id in BATCH_TASKS and BATCH_TASKS[task_id]['running']:
-        task = BATCH_TASKS[task_id]
-        
+        t = BATCH_TASKS[task_id]
         try:
-            # 1. GET MESSAGE
-            try:
-                msg = await userbot.get_messages(task['source'], task['current'])
-            except RPCError:
-                msg = None
-
-            # 2. CHECK IF EMPTY/DELETED
-            if not msg or msg.empty:
-                task['skipped'] += 1
-                task['current'] += 1
-                consecutive_errors += 1
-                if consecutive_errors > 20: await asyncio.sleep(5)
-                continue 
-
-            consecutive_errors = 0 # Reset error count if msg found
+            msg = await userbot.get_messages(t['source'], t['current'])
             
-            # 3. COPY MESSAGE
+            if not msg or msg.empty:
+                t['skipped'] += 1
+                t['current'] += 1
+                continue
+
             if not msg.service:
                 try:
-                    await userbot.copy_message(task['dest'], task['source'], msg.id)
-                    task['total'] += 1
-                    if task['total'] % 5 == 0: await update_log(task_id)
-                    await asyncio.sleep(3) # Safe Delay
-                    
-                except ChatWriteForbidden:
-                    # Critical Error: Bot cannot write to destination
-                    logger.error(f"Write Forbidden in {task['dest']}. Trying to join...")
-                    # Try to join purely based on ID is hard, usually handled in setup.
-                    # We just skip this message to avoid infinite loop
-                    task['skipped'] += 1
-                    
-                except FloodWait as e:
-                    logger.warning(f"Sleeping {e.value}s")
-                    await asyncio.sleep(e.value + 5)
-                    
-                except RPCError as e:
-                    logger.error(f"Copy Fail {msg.id}: {e}")
-                    task['skipped'] += 1
-            
-            task['current'] += 1
-            
+                    # Try direct copy first
+                    await userbot.copy_message(t['dest'], t['source'], msg.id)
+                    t['total'] += 1
+                except ChatForwardsRestricted:
+                    # Handle Protected Content (Download & Upload)
+                    try:
+                        file_path = await userbot.download_media(msg)
+                        if file_path:
+                            if msg.photo: await userbot.send_photo(t['dest'], file_path, caption=msg.caption)
+                            elif msg.video: await userbot.send_video(t['dest'], file_path, caption=msg.caption)
+                            elif msg.document: await userbot.send_document(t['dest'], file_path, caption=msg.caption)
+                            os.remove(file_path)
+                            t['total'] += 1
+                        else: raise Exception("Download Failed")
+                    except Exception as e:
+                        t['failed'] += 1
+                        t['last_error'] = "Protected/Down-Up Fail"
+                except ChatAdminRequired:
+                    t['last_error'] = "Need Admin in Dest!"
+                    t['failed'] += 1
+                except Exception as e:
+                    t['failed'] += 1
+                    t['last_error'] = str(e)[:30]
+
+            t['current'] += 1
+            if t['total'] % 2 == 0: await update_live_report(task_id)
+            await asyncio.sleep(3)
+
+        except FloodWait as e: await asyncio.sleep(e.value + 5)
         except Exception as e:
-            logger.error(f"Worker Loop Error: {e}")
+            t['last_error'] = "Source Access Denied"
             await asyncio.sleep(5)
 
-# ================= HANDLERS =================
+# ================= UI HANDLERS =================
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, message):
-    USER_STATE[message.from_user.id] = None
-    await message.reply_text(
-        "🚀 **Pro Media Forwarder (Auto-Join Fixed)**\nSelect option:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Start Task", callback_data="new_batch")],
-            [InlineKeyboardButton("📊 Status", callback_data="view_status")]
-        ])
+    text = (
+        "👋 **Welcome to Media Forwarder V4**\n\n"
+        "I can bypass **Protected Content** restrictions.\n"
+        "Please ensure the Userbot is admin in Destination."
     )
+    btns = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Start New Batch", callback_data="setup_src")],
+        [InlineKeyboardButton("📊 My Tasks", callback_data="status")]
+    ])
+    await message.reply_text(text, reply_markup=btns)
 
 @app.on_callback_query()
-async def cb_handler(client, query: CallbackQuery):
+async def cb_manager(client, query: CallbackQuery):
     uid = query.from_user.id
     data = query.data
-    if data == "new_batch":
-        USER_STATE[uid] = {"step": "SOURCE"}
-        await query.message.edit_text("🔗 **Step 1:** Send Source Channel Link.")
-    elif data == "view_status":
-        active_btns = []
-        for tid, t_info in BATCH_TASKS.items():
-            if t_info['running'] and t_info['user_id'] == uid:
-                active_btns.append([InlineKeyboardButton(f"🛑 Stop {tid}", callback_data=f"kill_{tid}")])
-        if not active_btns: await query.answer("No active tasks.", show_alert=True)
-        else: await query.message.edit_text("Active Tasks:", reply_markup=InlineKeyboardMarkup(active_btns))
+
+    if data == "setup_src":
+        USER_STATE[uid] = {"step": "SRC"}
+        await query.message.edit_text("🔗 **Step 1/3:**\nSend the **Source** Channel Link or ID.")
+
+    elif data == "status":
+        active = [tid for tid, info in BATCH_TASKS.items() if info['user_id'] == uid]
+        if not active: return await query.answer("No running tasks.", show_alert=True)
+        # Show list of tasks... (Simplified)
+        await query.answer("Reporting is live in your DM.")
+
     elif data.startswith("kill_"):
         tid = int(data.split("_")[1])
         if tid in BATCH_TASKS:
             BATCH_TASKS[tid]['running'] = False
-            await query.answer("Stopped!")
+            await query.message.edit_text(f"✅ Task `{tid}` has been stopped.")
             del BATCH_TASKS[tid]
 
 @app.on_message(filters.private & ~filters.command("start"))
-async def state_manager(client, message):
+async def setup_flow(client, message):
     uid = message.from_user.id
-    if uid not in USER_STATE or not USER_STATE[uid]: return
-    step = USER_STATE[uid]["step"]
+    if uid not in USER_STATE: return
     
-    # --- SOURCE STEP ---
-    if step == "SOURCE":
-        status_msg = await message.reply("⏳ **Joining/Checking Source...**")
-        src = await resolve_chat(message.text)
+    state = USER_STATE[uid]
+    
+    if state['step'] == "SRC":
+        chat = await resolve_chat(message.text)
+        if not chat: return await message.reply("❌ Invalid Source/Userbot not joined.")
         
-        if src:
-            USER_STATE[uid]["source_id"] = src
-            start_id = get_link_msg_id(message.text)
+        # Extract ID if link has it
+        start_id = 1
+        if "/" in message.text and message.text.split("/")[-1].isdigit():
+            start_id = int(message.text.split("/")[-1])
             
-            if start_id:
-                USER_STATE[uid]["start_id"] = start_id
-                USER_STATE[uid]["step"] = "DEST"
-                await status_msg.edit(f"✅ Source Connected!\nStart ID: `{start_id}`\n\n🔗 **Step 2:** Send Destination Link/ID.")
-            else:
-                USER_STATE[uid]["step"] = "ASK_ID"
-                await status_msg.edit("✅ Source Connected!\n🔢 **Now send the Start Message ID** (e.g. 2).")
-        else: 
-            await status_msg.edit("❌ **Cannot Access Source.**\nEnsure Userbot is joined or link is correct.")
+        USER_STATE[uid].update({"src": chat, "start": start_id, "step": "DEST"})
+        await message.reply(f"✅ Source Set. Start ID: `{start_id}`\n\n📥 **Step 2/3:**\nSend **Destination** Channel Link/ID.")
 
-    # --- ASK ID STEP ---
-    elif step == "ASK_ID":
-        try:
-            USER_STATE[uid]["start_id"] = int(message.text)
-            USER_STATE[uid]["step"] = "DEST"
-            await message.reply("✅ ID Saved. Now send **Destination Link**.")
-        except: 
-            await message.reply("❌ Send a number only.")
-
-    # --- DESTINATION STEP ---
-    elif step == "DEST":
-        status_msg = await message.reply("⏳ **Joining/Checking Destination...**")
-        dest = await resolve_chat(message.text)
+    elif state['step'] == "DEST":
+        chat = await resolve_chat(message.text)
+        if not chat: return await message.reply("❌ Invalid Destination.")
         
-        if dest:
-            tid = random.randint(1000, 9999)
-            
-            BATCH_TASKS[tid] = {
-                "source": USER_STATE[uid]["source_id"],
-                "dest": dest,
-                "current": USER_STATE[uid]["start_id"],
-                "total": 0, "skipped": 0, "running": True,
-                "user_id": uid, "log_msg_id": status_msg.id
-            }
-            
-            await status_msg.edit(f"🚀 **Task {tid} Started!**\nAuto-Joined Chats ✅\nForwarding from ID: {USER_STATE[uid]['start_id']}")
-            USER_STATE[uid] = None
-            asyncio.create_task(run_batch_worker(tid))
-        else: 
-            await status_msg.edit("❌ **Destination Error!**\nBot failed to join/find destination.\nMake sure the link is correct.")
+        USER_STATE[uid].update({"dest": chat})
+        tid = random.randint(1000, 9999)
+        
+        log_msg = await message.reply(f"⏳ **Initializing Task {tid}...**")
+        
+        BATCH_TASKS[tid] = {
+            "source": state['src'], "dest": chat, "current": state['start'],
+            "total": 0, "failed": 0, "skipped": 0, "running": True,
+            "user_id": uid, "log_msg_id": log_msg.id, "last_error": "None"
+        }
+        
+        del USER_STATE[uid]
+        asyncio.create_task(run_batch_worker(tid))
 
 # ================= BOOT =================
 
 async def main():
-    print("--- Starting Bots ---")
     await app.start()
     await userbot.start()
-    print("--- System Ready ---")
+    print("V4 PROTECTED FORWARDER READY")
     await idle()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
-                    
+    asyncio.get_event_loop().run_until_complete(main())
+    
