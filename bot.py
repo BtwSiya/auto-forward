@@ -12,6 +12,7 @@ from pyrogram.errors import (
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 
 # ================= CONFIGURATION =================
+# SECURITY WARNING: Aapne API Keys public kar di hain. Is code ke chalne ke baad keys reset karein.
 API_ID = 21705136
 API_HASH = "78730e89d196e160b0f1992018c6cb19"
 BOT_TOKEN = "8572528424:AAErREWZ0rxRYnzyJw06dRgOsrwQRcEhlkc"
@@ -53,7 +54,7 @@ async def resolve_chat(link_or_id: str):
             return chat.id
     except Exception: return None
 
-# ================= CORE ENGINE =================
+# ================= CORE ENGINE (FIXED) =================
 
 async def update_live_report(task_id, current_activity="Running"):
     t = BATCH_TASKS.get(task_id)
@@ -91,7 +92,7 @@ async def run_batch_worker(task_id):
 
             if not msg.service:
                 try:
-                    # ALBUM HANDLING (Fixing Duplicate Sending)
+                    # ALBUM HANDLING (Fixing Duplicate Sending & Metadata)
                     if msg.media_group_id:
                         if msg.media_group_id in PROCESSED_GROUPS:
                             t['current'] += 1
@@ -108,23 +109,50 @@ async def run_batch_worker(task_id):
                             await update_live_report(task_id, "Downloading Restricted Album...")
                             album = await userbot.get_media_group(t['source'], msg.id)
                             media_group = []
-                            paths = []
+                            files_to_delete = []
+                            
                             for m in album:
                                 path = await userbot.download_media(m)
                                 if path:
-                                    paths.append(path)
-                                    if m.photo: media_group.append(InputMediaPhoto(path, caption=m.caption))
-                                    elif m.video: media_group.append(InputMediaVideo(path, caption=m.caption))
-                                    else: media_group.append(InputMediaDocument(path, caption=m.caption))
+                                    files_to_delete.append(path)
+                                    # Handle Thumbnail and Metadata for Albums
+                                    thumb_path = None
+                                    if m.photo:
+                                        media_group.append(InputMediaPhoto(path, caption=m.caption))
+                                    elif m.video:
+                                        # Extract Metadata
+                                        duration = m.video.duration or 0
+                                        width = m.video.width or 0
+                                        height = m.video.height or 0
+                                        if m.video.thumbs:
+                                            try:
+                                                thumb_path = await userbot.download_media(m.video.thumbs[0].file_id)
+                                                if thumb_path: files_to_delete.append(thumb_path)
+                                            except: pass
+                                        
+                                        media_group.append(InputMediaVideo(
+                                            path, 
+                                            caption=m.caption,
+                                            duration=duration,
+                                            width=width,
+                                            height=height,
+                                            thumb=thumb_path,
+                                            supports_streaming=True
+                                        ))
+                                    elif m.document:
+                                        media_group.append(InputMediaDocument(path, caption=m.caption))
                             
                             if media_group:
+                                await update_live_report(task_id, "Uploading Album...")
                                 await userbot.send_media_group(t['dest'], media=media_group)
                                 t['total'] += 1
                                 PROCESSED_GROUPS[msg.media_group_id] = True
-                            for p in paths:
+                            
+                            # Cleanup
+                            for p in files_to_delete:
                                 if os.path.exists(p): os.remove(p)
                     
-                    # SINGLE MESSAGE HANDLING (Fixing Black Screen)
+                    # SINGLE MESSAGE HANDLING (Fixing Black Screen & Duration)
                     else:
                         try:
                             await userbot.copy_message(t['dest'], t['source'], msg.id)
@@ -132,11 +160,60 @@ async def run_batch_worker(task_id):
                         except ChatForwardsRestricted:
                             await update_live_report(task_id, "File Detected: Downloading...")
                             path = await userbot.download_media(msg)
+                            
                             if path:
                                 await update_live_report(task_id, "Uploading to Destination...")
-                                if msg.photo: await userbot.send_photo(t['dest'], path, caption=msg.caption)
-                                elif msg.video: await userbot.send_video(t['dest'], path, caption=msg.caption, supports_streaming=True)
-                                else: await userbot.send_document(t['dest'], path, caption=msg.caption)
+                                
+                                if msg.photo:
+                                    await userbot.send_photo(t['dest'], path, caption=msg.caption)
+                                elif msg.video:
+                                    # FIX: Extract Metadata and Thumbnail
+                                    duration = msg.video.duration or 0
+                                    width = msg.video.width or 0
+                                    height = msg.video.height or 0
+                                    thumb_path = None
+                                    
+                                    if msg.video.thumbs:
+                                        try:
+                                            thumb_path = await userbot.download_media(msg.video.thumbs[0].file_id)
+                                        except: pass
+
+                                    await userbot.send_video(
+                                        t['dest'], 
+                                        path, 
+                                        caption=msg.caption, 
+                                        supports_streaming=True,
+                                        duration=duration,
+                                        width=width,
+                                        height=height,
+                                        thumb=thumb_path
+                                    )
+                                    
+                                    if thumb_path and os.path.exists(thumb_path):
+                                        os.remove(thumb_path)
+                                        
+                                elif msg.document:
+                                    # Try to preserve thumb for documents too if available
+                                    thumb_path = None
+                                    if msg.document.thumbs:
+                                        try:
+                                            thumb_path = await userbot.download_media(msg.document.thumbs[0].file_id)
+                                        except: pass
+                                        
+                                    await userbot.send_document(
+                                        t['dest'], 
+                                        path, 
+                                        caption=msg.caption,
+                                        thumb=thumb_path
+                                    )
+                                    if thumb_path and os.path.exists(thumb_path):
+                                        os.remove(thumb_path)
+                                else:
+                                    # Fallback for voice/audio
+                                    if msg.voice: await userbot.send_voice(t['dest'], path, caption=msg.caption)
+                                    elif msg.audio: await userbot.send_audio(t['dest'], path, caption=msg.caption)
+                                    else: await userbot.send_document(t['dest'], path, caption=msg.caption)
+
                                 if os.path.exists(path): os.remove(path)
                                 t['total'] += 1
                             else: raise Exception("Download Failed")
@@ -160,9 +237,9 @@ async def run_batch_worker(task_id):
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, message):
     text = (
-        "🚀 **Advanced Media Forwarder v5 (Final Fix)**\n\n"
-        "✅ No Duplicates (Album Fix)\n"
-        "✅ No Black Screen (Bypass Fix)\n"
+        "🚀 **Advanced Media Forwarder **\n\n"
+        "✅ Yoo Baby \n"
+        "✅ **Fix:** Proper Video Duration & Thumbnails\n"
         "✅ Live Activity Report\n"
         "✅ Unlimited File Size Support"
     )
@@ -219,8 +296,9 @@ async def state_manager(client, message):
 async def main():
     await app.start()
     await userbot.start()
-    print("--- Pro Forwarder V5 Ready (Optimized) ---")
+    print("--- Pro Forwarder V6 Ready (Metadata Fixed) ---")
     await idle()
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
+            
