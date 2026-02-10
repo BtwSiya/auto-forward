@@ -31,14 +31,22 @@ PROCESSED_GROUPS = {} # To fix 3-4 times repeat issue
 # ================= SMART UTILS =================
 
 async def resolve_chat(link_or_id: str):
-    link_or_id = str(link_or_id).strip()
+    link_or_id = str(link_or_id).strip().rstrip("/") # Trailing slash hataya
+    
+    # Direct ID check
     if re.match(r"^-?\d+$", link_or_id): return int(link_or_id)
+    
+    # Private Link Handling
     if "t.me/c/" in link_or_id:
         try:
             parts = link_or_id.split('/')
-            return int("-100" + parts[parts.index('c') + 1])
+            # /c/ ke baad wala part chat ID hota hai
+            chat_id_idx = parts.index('c') + 1
+            return int("-100" + parts[chat_id_idx])
         except: return None
+        
     try:
+        # Joinchat Links
         if "t.me/+" in link_or_id or "t.me/joinchat/" in link_or_id:
             try:
                 chat = await userbot.join_chat(link_or_id)
@@ -47,6 +55,8 @@ async def resolve_chat(link_or_id: str):
                 chat = await userbot.get_chat(link_or_id)
                 return chat.id
         else:
+            # Public Username Handling (Fixed logic)
+            # URL se username nikalna (last part)
             username = link_or_id.split('/')[-1]
             try: await userbot.join_chat(username)
             except: pass
@@ -83,6 +93,7 @@ async def run_batch_worker(task_id):
     while task_id in BATCH_TASKS and BATCH_TASKS[task_id]['running']:
         t = BATCH_TASKS[task_id]
         try:
+            # Ensure we are getting the exact message ID
             msg = await userbot.get_messages(t['source'], t['current'])
             
             if not msg or msg.empty:
@@ -254,7 +265,7 @@ async def cb_handler(client, query: CallbackQuery):
     uid, data = query.from_user.id, query.data
     if data == "new_batch":
         USER_STATE[uid] = {"step": "SOURCE"}
-        await query.message.edit_text("🔗 **Step 1:**\nSend Source Channel Link.")
+        await query.message.edit_text("🔗 **Step 1:**\nSend Source Channel Link.\n_(Example: t.me/channel/123 to start from msg 123)_")
     elif data == "view_status":
         active_btns = [[InlineKeyboardButton(f"🛑 Stop Task {tid}", callback_data=f"kill_{tid}")] 
                        for tid, t in BATCH_TASKS.items() if t['running'] and t['user_id'] == uid]
@@ -274,31 +285,60 @@ async def state_manager(client, message):
     
     if step == "SOURCE":
         msg = await message.reply("🔍 Checking Source...")
-        source = await resolve_chat(message.text)
-        if not source: return await msg.edit("❌ **Invalid Source!**")
-        start_id = int(message.text.split("/")[-1]) if "/" in message.text and message.text.split("/")[-1].isdigit() else 1
+        
+        # --- FIXED LOGIC FOR LINK PARSING ---
+        user_input = message.text.strip()
+        start_id = 1
+        chat_link = user_input
+        
+        # Check if user provided a specific message link (ends with numbers)
+        # Handles: t.me/c/123123/100  AND  t.me/username/100
+        if re.search(r"/\d+$", user_input):
+            try:
+                # Split from right side once
+                parts = user_input.rsplit("/", 1) 
+                if len(parts) == 2 and parts[1].isdigit():
+                    start_id = int(parts[1])
+                    chat_link = parts[0] # Remove the message ID from the link
+            except:
+                pass
+        
+        source = await resolve_chat(chat_link)
+        
+        if not source: return await msg.edit("❌ **Invalid Source!**\nMake sure the bot/userbot is joined.")
+        
         USER_STATE[uid] = {"step": "DEST", "source": source, "start": start_id}
-        await msg.edit(f"✅ **Source Found!**\n\n📥 **Step 2:**\nSend Destination Channel Link.")
+        await msg.edit(f"✅ **Source Found!**\n🆔 Start ID: `{start_id}`\n\n📥 **Step 2:**\nSend Destination Channel Link.")
+        
     elif step == "DEST":
         msg = await message.reply("🔍 Checking Destination...")
-        dest = await resolve_chat(message.text)
+        
+        # Handle destination link (clean ID if provided accidentally)
+        dest_input = message.text.strip()
+        if re.search(r"/\d+$", dest_input):
+            dest_input = dest_input.rsplit("/", 1)[0]
+            
+        dest = await resolve_chat(dest_input)
         if not dest: return await msg.edit("❌ **Invalid Destination!**")
+        
         task_id = random.randint(1000, 9999)
         BATCH_TASKS[task_id] = {
-            "source": USER_STATE[uid]['source'], "dest": dest, "current": USER_STATE[uid]['start'],
+            "source": USER_STATE[uid]['source'], 
+            "dest": dest, 
+            "current": USER_STATE[uid]['start'], # Correctly using parsed start ID
             "total": 0, "failed": 0, "skipped": 0, "running": True,
             "user_id": uid, "log_msg_id": msg.id, "last_error": "None"
         }
         del USER_STATE[uid]
-        await msg.edit(f"🚀 **Task {task_id} Initialized!**")
+        await msg.edit(f"🚀 **Task {task_id} Initialized!**\nStarting from ID: `{BATCH_TASKS[task_id]['current']}`")
         asyncio.create_task(run_batch_worker(task_id))
 
 async def main():
     await app.start()
     await userbot.start()
-    print("--- Pro Forwarder V6 Ready (Metadata Fixed) ---")
+    print("--- Pro Forwarder V6 Ready (Metadata & Logic Fixed) ---")
     await idle()
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
-            
+    
