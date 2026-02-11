@@ -103,7 +103,7 @@ async def run_batch_worker(task_id):
 
             if not msg.service:
                 try:
-                    # ALBUM HANDLING (Fixing Duplicate Sending & Metadata)
+                    # ALBUM HANDLING (Fixing Duplicate Sending, Series & One-by-One Issue)
                     if msg.media_group_id:
                         if msg.media_group_id in PROCESSED_GROUPS:
                             t['current'] += 1
@@ -111,57 +111,71 @@ async def run_batch_worker(task_id):
                         
                         await update_live_report(task_id, "Processing Album (Grouping)...")
                         try:
-                            # Try copy first
-                            await userbot.copy_media_group(t['dest'], t['source'], msg.id)
-                            t['total'] += 1
-                            PROCESSED_GROUPS[msg.media_group_id] = True
-                        except ChatForwardsRestricted:
-                            # Download & Upload bypass for Albums (Fix Black Screen)
-                            await update_live_report(task_id, "Downloading Restricted Album...")
+                            # Fetch full album first to manage series correctly
                             album = await userbot.get_media_group(t['source'], msg.id)
-                            media_group = []
-                            files_to_delete = []
+                            highest_id = max([m.id for m in album]) # Get highest ID to maintain series
                             
-                            for m in album:
-                                path = await userbot.download_media(m)
-                                if path:
-                                    files_to_delete.append(path)
-                                    # Handle Thumbnail and Metadata for Albums
-                                    thumb_path = None
-                                    if m.photo:
-                                        media_group.append(InputMediaPhoto(path, caption=m.caption))
-                                    elif m.video:
-                                        # Extract Metadata
-                                        duration = m.video.duration or 0
-                                        width = m.video.width or 0
-                                        height = m.video.height or 0
-                                        if m.video.thumbs:
-                                            try:
-                                                thumb_path = await userbot.download_media(m.video.thumbs[0].file_id)
-                                                if thumb_path: files_to_delete.append(thumb_path)
-                                            except: pass
-                                        
-                                        media_group.append(InputMediaVideo(
-                                            path, 
-                                            caption=m.caption,
-                                            duration=duration,
-                                            width=width,
-                                            height=height,
-                                            thumb=thumb_path,
-                                            supports_streaming=True
-                                        ))
-                                    elif m.document:
-                                        media_group.append(InputMediaDocument(path, caption=m.caption))
-                            
-                            if media_group:
-                                await update_live_report(task_id, "Uploading Album...")
-                                await userbot.send_media_group(t['dest'], media=media_group)
-                                t['total'] += 1
+                            try:
+                                # Try copy first
+                                await userbot.copy_media_group(t['dest'], t['source'], msg.id)
+                                t['total'] += len(album) # Correctly count all album items
                                 PROCESSED_GROUPS[msg.media_group_id] = True
-                            
-                            # Cleanup
-                            for p in files_to_delete:
-                                if os.path.exists(p): os.remove(p)
+                            except Exception: 
+                                # Catch ALL exceptions here to force grouped download/upload bypass
+                                # (Fixes the issue where some errors broke the group and sent one-by-one)
+                                await update_live_report(task_id, "Downloading Restricted Album...")
+                                media_group = []
+                                files_to_delete = []
+                                
+                                for m in album:
+                                    path = await userbot.download_media(m)
+                                    if path:
+                                        files_to_delete.append(path)
+                                        # Handle Thumbnail and Metadata for Albums
+                                        thumb_path = None
+                                        if m.photo:
+                                            media_group.append(InputMediaPhoto(path, caption=m.caption))
+                                        elif m.video:
+                                            # Extract Metadata
+                                            duration = m.video.duration or 0
+                                            width = m.video.width or 0
+                                            height = m.video.height or 0
+                                            if m.video.thumbs:
+                                                try:
+                                                    thumb_path = await userbot.download_media(m.video.thumbs[0].file_id)
+                                                    if thumb_path: files_to_delete.append(thumb_path)
+                                                except: pass
+                                            
+                                            media_group.append(InputMediaVideo(
+                                                path, 
+                                                caption=m.caption,
+                                                duration=duration,
+                                                width=width,
+                                                height=height,
+                                                thumb=thumb_path,
+                                                supports_streaming=True
+                                            ))
+                                        elif m.document:
+                                            media_group.append(InputMediaDocument(path, caption=m.caption))
+                                
+                                if media_group:
+                                    await update_live_report(task_id, "Uploading Album...")
+                                    # Yeh guarantee karega ki saari files ek hi msg series me album ban ke jayengi
+                                    await userbot.send_media_group(t['dest'], media=media_group)
+                                    t['total'] += len(media_group)
+                                    PROCESSED_GROUPS[msg.media_group_id] = True
+                                
+                                # Cleanup
+                                for p in files_to_delete:
+                                    if os.path.exists(p): os.remove(p)
+
+                            # Jaha se start kiya tha wahi se exact series maintain rakhne ke liye jump karein
+                            if highest_id > t['current']:
+                                t['current'] = highest_id
+
+                        except Exception as e:
+                            t['failed'] += 1
+                            t['last_error'] = str(e)[:100]
                     
                     # SINGLE MESSAGE HANDLING (Fixing Black Screen & Duration)
                     else:
@@ -341,4 +355,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
-    
+                                
