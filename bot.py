@@ -225,13 +225,12 @@ async def live_stream_monitor(client, message):
         if task['running'] and task['source'] == message.chat.id:
             # Check if we are already past this ID in the batch loop
             if message.id >= task['current']:
-                logger.info(f"New Live Message detected in {message.chat.id}")
-                success_count = await smart_forwarder(task_id, message)
-                if success_count > 0:
-                    task['total'] += success_count
-                    task['current'] = message.id + 1
-                    await update_task_ui(task_id, "⚡ Live Message Forwarded!")
-
+    # Instant Forwarding logic
+            await userbot.copy_message(task['dest'], task['source'], message.id)
+            task['total'] += 1
+            task['current'] = message.id + 1
+            await update_task_ui(task_id, "⚡ Live Forwarded!")
+    
 # ==========================================================
 #                   CORE TASK MANAGEMENT
 # ==========================================================
