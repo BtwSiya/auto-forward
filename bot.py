@@ -6,8 +6,7 @@ import os
 from pyrogram import Client, filters, idle
 from pyrogram.errors import (
     FloodWait, RPCError, UserAlreadyParticipant, 
-    MessageNotModified, ChatWriteForbidden, ChatAdminRequired,
-    ChatForwardsRestricted, InviteHashExpired, UsernameNotOccupied
+    ChatForwardsRestricted, InviteHashExpired
 )
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 
@@ -18,42 +17,35 @@ BOT_TOKEN = "8572528424:AAG3Bk4L-xnpmu2IWMfRS_m5AG8foG7cPRc"
 SESSION_STRING = "BQFGCokAgeUYbfqZyyM_tUlZOL9e4XM-eNqZX7_433fLwjvGB4SKL2YC6GBy-7S8ySKF4mwvaFE3FoUPQBrptI68vigVx7RBBwcUlV8LjHDK7CDuyin3nF8vIusS6g3ujLgQBBKajb7IhGPQVOMm-9q2kdROazENzXx-BHPVr3XaSeLM3gtPnY1T_y_RukGosNOfHTfwMkD0oS7fj0zl6KNwO4OgQEAFzTXmfpw9cAW9hCItiT16Q9UE9E75IhekfoPxCSVgwYt35fN7FCPzz8hQNIQwSLikifoeb5XAYSBGHwOnwIdiiovPwLZ9cB9tbEE4utODrHCqZLgVNhcTcjRcVod2MwAAAAF5efmpAA"
 
 logging.basicConfig(level=logging.ERROR)
-logger = logging.getLogger(__name__)
-
 app = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 userbot = Client("userbot_session", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, in_memory=True)
 
 BATCH_TASKS = {}
 USER_STATE = {}
-PROCESSED_ALBUMS = [] 
+PROCESSED_GROUPS = set()
 
-# ================= SMART UTILS =================
+# ================= UTILS =================
 
-async def resolve_chat(link_or_id: str):
-    link_or_id = str(link_or_id).strip().rstrip("/")
-    if re.match(r"^-?\d+$", link_or_id): 
-        return int(link_or_id)
-    if "t.me/c/" in link_or_id:
+async def resolve_chat(link):
+    link = str(link).strip().rstrip("/")
+    if re.match(r"^-?\d+$", link): return int(link)
+    if "t.me/c/" in link:
         try:
-            parts = link_or_id.split('/')
-            chat_id_idx = parts.index('c') + 1
-            return int("-100" + parts[chat_id_idx])
-        except: pass
-    if "+" in link_or_id or "joinchat" in link_or_id:
+            parts = link.split('/')
+            return int("-100" + parts[parts.index('c') + 1])
+        except: return None
+    if "t.me/+" in link or "joinchat" in link:
         try:
-            try: await userbot.join_chat(link_or_id)
+            try: await userbot.join_chat(link)
             except UserAlreadyParticipant: pass
-            chat_info = await userbot.get_chat(link_or_id)
-            return chat_info.id
-        except Exception as e:
-            return None
+            chat = await userbot.get_chat(link)
+            return chat.id
+        except: return None
     try:
-        username = link_or_id.split('/')[-1]
-        try: await userbot.join_chat(username)
-        except: pass
+        username = link.split('/')[-1]
         chat = await userbot.get_chat(username)
         return chat.id
-    except Exception: return None
+    except: return None
 
 async def get_thumb(msg):
     try:
@@ -66,196 +58,142 @@ async def get_thumb(msg):
 
 # ================= CORE ENGINE =================
 
-async def update_live_report(task_id, activity):
+async def update_report(task_id, activity):
     t = BATCH_TASKS.get(task_id)
     if not t: return
     text = (
         f"📊 **Live Task Report: {task_id}**\n\n"
         f"✅ **Success:** `{t['total']}`\n"
-        f"❌ **Failed:** `{t['failed']}`\n"
-        f"⏭️ **Skipped:** `{t['skipped']}`\n"
-        f"📍 **Current ID:** `{t['current']}`\n\n"
+        f"📍 **Current ID:** `{t['current']}`\n"
         f"⚡ **Activity:** `{activity}`\n"
-        f"📢 **Status:** {'🟢 Running' if t['running'] else '🛑 Stopped'}\n"
-        f"⚠️ **Last Error:** `{t['last_error']}`"
+        f"📢 **Status:** {'🟢 Running' if t['running'] else '🛑 Stopped'}"
     )
-    try:
-        await app.edit_message_text(
-            t['user_id'], t['log_msg_id'], text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🛑 Stop Task {task_id}", callback_data=f"kill_{task_id}")]])
-        )
+    try: await app.edit_message_text(t['user_id'], t['log_msg_id'], text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🛑 Stop Task", callback_data=f"kill_{task_id}")]]))
     except: pass
 
-async def run_batch_worker(task_id):
+async def run_worker(task_id):
     while task_id in BATCH_TASKS and BATCH_TASKS[task_id]['running']:
         t = BATCH_TASKS[task_id]
         try:
             msg = await userbot.get_messages(t['source'], t['current'])
             
             if not msg or msg.empty:
-                try:
-                    history = await userbot.get_history(t['source'], limit=1)
-                    if history and t['current'] > history[0].id:
-                        await update_live_report(task_id, "Waiting for new messages...")
-                        await asyncio.sleep(10)
-                        continue
-                    else:
-                        t['skipped'] += 1
-                        t['current'] += 1
-                        continue
-                except:
-                    t['current'] += 1
+                # Live Monitoring: Check if we reached the end
+                history = await userbot.get_history(t['source'], limit=1)
+                if history and t['current'] > history[0].id:
+                    await update_report(task_id, "Waiting for new messages...")
+                    await asyncio.sleep(10)
                     continue
+                t['current'] += 1
+                continue
 
             if msg.service:
                 t['current'] += 1
                 continue
 
-            # ALBUM HANDLING
+            # GROUPING/ALBUM LOGIC
             if msg.media_group_id:
-                if msg.media_group_id in PROCESSED_ALBUMS:
+                if msg.media_group_id in PROCESSED_GROUPS:
                     t['current'] += 1
                     continue
                 
                 try:
-                    media_group = await userbot.get_media_group(t['source'], msg.id)
-                    PROCESSED_ALBUMS.append(msg.media_group_id)
-                    if len(PROCESSED_ALBUMS) > 100: PROCESSED_ALBUMS.pop(0)
-                    last_id = max([m.id for m in media_group])
+                    album = await userbot.get_media_group(t['source'], msg.id)
+                    PROCESSED_GROUPS.add(msg.media_group_id)
                     
                     try:
                         await userbot.copy_media_group(t['dest'], t['source'], msg.id)
-                        t['total'] += len(media_group)
+                        t['total'] += len(album)
                     except ChatForwardsRestricted:
-                        await update_live_report(task_id, "Processing Album Bypass...")
-                        input_media = []
-                        temp_files = []
-                        for m in media_group:
+                        # Restricted Content Bypass
+                        media_list = []
+                        files = []
+                        for m in album:
                             path = await userbot.download_media(m)
-                            temp_files.append(path)
+                            files.append(path)
                             thumb = await get_thumb(m)
-                            if thumb: temp_files.append(thumb)
+                            if thumb: files.append(thumb)
                             
-                            cap = m.caption or ""
-                            if m.photo: input_media.append(InputMediaPhoto(path, caption=cap))
-                            elif m.video: input_media.append(InputMediaVideo(path, caption=cap, thumb=thumb, width=m.video.width, height=m.video.height, duration=m.video.duration, supports_streaming=True))
-                            elif m.document: input_media.append(InputMediaDocument(path, caption=cap, thumb=thumb))
-                            elif m.audio: input_media.append(InputMediaAudio(path, caption=cap, thumb=thumb, duration=m.audio.duration))
-
-                        await userbot.send_media_group(t['dest'], media=input_media)
-                        t['total'] += len(media_group)
-                        for f in temp_files:
+                            if m.photo: media_list.append(InputMediaPhoto(path, caption=m.caption))
+                            elif m.video: media_list.append(InputMediaVideo(path, caption=m.caption, thumb=thumb, duration=m.video.duration, width=m.video.width, height=m.video.height, supports_streaming=True))
+                            elif m.document: media_list.append(InputMediaDocument(path, caption=m.caption, thumb=thumb))
+                        
+                        await userbot.send_media_group(t['dest'], media=media_list)
+                        t['total'] += len(album)
+                        for f in files: 
                             if f and os.path.exists(f): os.remove(f)
 
-                    t['current'] = last_id + 1
+                    t['current'] = max([m.id for m in album]) + 1
                     continue
-                except Exception as e:
-                    t['failed'] += 1
-                    t['last_error'] = str(e)[:50]
-                    t['current'] += 1
-                    continue
+                except: pass
 
             # SINGLE MESSAGE
-            else:
-                try:
-                    if msg.text:
-                        await userbot.send_message(t['dest'], msg.text, entities=msg.entities)
-                    else:
-                        try:
-                            await userbot.copy_message(t['dest'], t['source'], msg.id)
-                        except ChatForwardsRestricted:
-                            await update_live_report(task_id, "Processing File Bypass...")
-                            path = await userbot.download_media(msg)
-                            thumb = await get_thumb(msg)
-                            cap = msg.caption or ""
-                            
-                            if msg.photo: await userbot.send_photo(t['dest'], path, caption=cap)
-                            elif msg.video: await userbot.send_video(t['dest'], path, caption=cap, thumb=thumb, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, supports_streaming=True)
-                            elif msg.document: await userbot.send_document(t['dest'], path, caption=cap, thumb=thumb)
-                            elif msg.audio: await userbot.send_audio(t['dest'], path, caption=cap, thumb=thumb, duration=msg.audio.duration)
-                            elif msg.voice: await userbot.send_voice(t['dest'], path, caption=cap)
-                            
-                            if path and os.path.exists(path): os.remove(path)
-                            if thumb and os.path.exists(thumb): os.remove(thumb)
-                    t['total'] += 1
-                except Exception as e:
-                    t['failed'] += 1
-                    t['last_error'] = str(e)[:50]
+            try:
+                if msg.text:
+                    await userbot.send_message(t['dest'], msg.text, entities=msg.entities)
+                else:
+                    try:
+                        await userbot.copy_message(t['dest'], t['source'], msg.id)
+                    except ChatForwardsRestricted:
+                        path = await userbot.download_media(msg)
+                        thumb = await get_thumb(msg)
+                        if msg.photo: await userbot.send_photo(t['dest'], path, caption=msg.caption)
+                        elif msg.video: await userbot.send_video(t['dest'], path, caption=msg.caption, thumb=thumb, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, supports_streaming=True)
+                        elif msg.document: await userbot.send_document(t['dest'], path, caption=msg.caption, thumb=thumb)
+                        if path and os.path.exists(path): os.remove(path)
+                        if thumb and os.path.exists(thumb): os.remove(thumb)
+                t['total'] += 1
+            except: pass
 
             t['current'] += 1
-            await update_live_report(task_id, "Waiting...")
-            await asyncio.sleep(2)
+            await update_report(task_id, "Forwarding...")
+            await asyncio.sleep(1.5)
 
-        except FloodWait as e:
-            await asyncio.sleep(e.value + 5)
+        except FloodWait as e: await asyncio.sleep(e.value + 5)
         except Exception as e:
-            t['last_error'] = str(e)[:50]
             await asyncio.sleep(5)
 
-# ================= UI HANDLERS =================
+# ================= HANDLERS =================
 
 @app.on_message(filters.command("start") & filters.private)
-async def start_handler(_, message):
-    text = (
-        "🚀 **Pro Media Forwarder**\n\n"
-        "✅ Live Forwarding Enabled\n"
-        "✅ Private & Public Support\n"
-        "✅ Album & Text Support\n"
-        "✅ Black Screen Fix Active"
-    )
-    btns = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Start Task", callback_data="new_batch")],
-        [InlineKeyboardButton("📊 Tasks", callback_data="view_status")]
-    ])
-    await message.reply_text(text, reply_markup=btns)
+async def start(c, m):
+    USER_STATE[m.from_user.id] = {"step": "SOURCE"}
+    await m.reply("🔗 **Step 1:**\nSend Source Link.")
 
-@app.on_callback_query()
-async def cb_handler(client, query: CallbackQuery):
-    uid, data = query.from_user.id, query.data
-    if data == "new_batch":
-        USER_STATE[uid] = {"step": "SOURCE"}
-        await query.message.edit_text("🔗 **Step 1:**\nSend Source Link.")
-    elif data == "view_status":
-        btns = [[InlineKeyboardButton(f"🛑 Stop {tid}", callback_data=f"kill_{tid}")] for tid, t in BATCH_TASKS.items() if t['running'] and t['user_id'] == uid]
-        if not btns: return await query.answer("No active tasks!")
-        await query.message.edit_text("📋 **Active Tasks:**", reply_markup=InlineKeyboardMarkup(btns))
-    elif data.startswith("kill_"):
-        tid = int(data.split("_")[1])
-        if tid in BATCH_TASKS: BATCH_TASKS[tid]['running'] = False
-        await query.message.edit_text(f"✅ Task {tid} stopped.")
+@app.on_callback_query(filters.regex("^kill_"))
+async def kill(c, q):
+    tid = int(q.data.split("_")[1])
+    if tid in BATCH_TASKS: BATCH_TASKS[tid]['running'] = False
+    await q.answer("Task Stopped", show_alert=True)
 
 @app.on_message(filters.private & ~filters.command("start"))
-async def state_manager(client, message):
-    uid = message.from_user.id
+async def steps(c, m):
+    uid = m.from_user.id
     if uid not in USER_STATE: return
-    step = USER_STATE[uid]["step"]
     
-    if step == "SOURCE":
-        user_input = message.text.strip()
+    if USER_STATE[uid]["step"] == "SOURCE":
+        res = await resolve_chat(m.text)
+        if not res: return await m.reply("❌ **Invalid Source!**")
+        
         start_id = 1
-        link = user_input
-        if re.search(r"/\d+$", user_input):
-            parts = user_input.rsplit('/', 1)
-            start_id = int(parts[1])
-            link = parts[0]
+        if "/" in m.text and m.text.split('/')[-1].isdigit():
+            start_id = int(m.text.split('/')[-1])
             
-        source = await resolve_chat(link)
-        if not source: return await message.reply("❌ Invalid Source!")
-        USER_STATE[uid] = {"step": "DEST", "source": source, "start": start_id}
-        await message.reply("📥 **Step 2:**\nSend Destination Link.")
+        USER_STATE[uid].update({"source": res, "start": start_id, "step": "DEST"})
+        await m.reply("✅ **Source Found!**\n\n📥 **Step 2:**\nSend Destination Link.")
 
-    elif step == "DEST":
-        dest = await resolve_chat(message.text)
-        if not dest: return await message.reply("❌ Invalid Destination!")
+    elif USER_STATE[uid]["step"] == "DEST":
+        res = await resolve_chat(m.text)
+        if not res: return await m.reply("❌ **Invalid Destination!**")
+        
         task_id = random.randint(1000, 9999)
-        msg = await message.reply("🚀 Initializing...")
+        log = await m.reply("🚀 **Initializing...**")
         BATCH_TASKS[task_id] = {
-            "source": USER_STATE[uid]['source'], "dest": dest, "current": USER_STATE[uid]['start'],
-            "total": 0, "failed": 0, "skipped": 0, "running": True,
-            "user_id": uid, "log_msg_id": msg.id, "last_error": "None"
+            "source": USER_STATE[uid]['source'], "dest": res, "current": USER_STATE[uid]['start'],
+            "total": 0, "running": True, "user_id": uid, "log_msg_id": log.id
         }
         del USER_STATE[uid]
-        asyncio.create_task(run_batch_worker(task_id))
+        asyncio.create_task(run_worker(task_id))
 
 async def main():
     await app.start()
@@ -264,3 +202,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
+                        
